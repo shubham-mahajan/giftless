@@ -15,6 +15,7 @@ from webargs.flaskparser import parser  # type: ignore
 
 from giftless.auth.identity import Permission
 from giftless.exc import InvalidPayload, NotFound
+from giftless.storage import ExternalStorage, exc
 from giftless.schema import ObjectSchema
 from giftless.storage import StreamingStorage, VerifiableStorage
 from giftless.transfer import PreAuthorizingTransferAdapter, ViewProvider
@@ -136,40 +137,21 @@ class BasicStreamingTransferAdapter(PreAuthorizingTransferAdapter, ViewProvider)
             response['authenticated'] = True
 
         return response
+    
 
     def download(self, organization: str, repo: str, oid: str, size: int,
                  extra: Optional[Dict[str, Any]] = None) -> Dict:
+        prefix = posixpath.join(organization, repo)
         response = {"oid": oid,
                     "size": size}
 
-        prefix = posixpath.join(organization, repo)
-        if not self.storage.exists(prefix, oid):
-            response['error'] = {
-                "code": 404,
-                "message": "Object does not exist"
-            }
+        try:
+            self._check_object(prefix, oid, size)
+            response.update(self.storage.get_download_action(prefix, oid, size, self.action_lifetime, extra))
+        except exc.StorageError as e:
+            response['error'] = e.as_dict()
 
-        elif self.storage.get_size(prefix, oid) != size:
-            response['error'] = {
-                "code": 422,
-                "message": "Object size does not match"
-            }
-
-        else:
-            download_url = ObjectsView.get_storage_url('get', organization, repo, oid)
-            preauth_url = self._preauth_url(download_url, organization, repo, actions={'read'}, oid=oid)
-
-            if extra and 'filename' in extra:
-                params = {'filename': extra['filename']}
-                preauth_url = add_query_params(preauth_url, params)
-
-            response['actions'] = {
-                "download": {
-                    "href": preauth_url,
-                    "header": {},
-                    "expires_in": self.action_lifetime
-                }
-            }
+        if response.get('actions', {}).get('download'):  # type: ignore
             response['authenticated'] = True
 
         return response
@@ -177,6 +159,15 @@ class BasicStreamingTransferAdapter(PreAuthorizingTransferAdapter, ViewProvider)
     def register_views(self, app):
         ObjectsView.register(app, init_argument=self.storage)
         VerifyView.register(app, init_argument=self.storage)
+    
+    def _check_object(self, prefix: str, oid: str, size: int):
+        """Raise specific domain error if object is not valid
+
+        NOTE: this does not use storage.verify_object directly because
+        we want ObjectNotFound errors to be propagated if raised
+        """
+        if self.storage.get_size(prefix, oid) != size:
+            raise exc.InvalidObject('Object size does not match')
 
 
 def factory(storage_class, storage_options, action_lifetime):
